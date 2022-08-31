@@ -20,7 +20,6 @@ from __future__ import division
 from __future__ import print_function
 
 import argparse
-import datetime
 import hashlib
 import os
 import struct
@@ -43,6 +42,7 @@ OPENSK_VID_PID = (0x1915, 0x521F)
 OPENSK_VENDOR_UPGRADE = 0x42
 OPENSK_VENDOR_UPGRADE_INFO = 0x43
 PAGE_SIZE = 0x1000
+METADATA_SIGN_OFFSET = 0x800
 KERNEL_SIZE = 0x20000
 APP_SIZE = 0x20000
 PARTITION_ADDRESS = {
@@ -53,7 +53,15 @@ ES256_ALGORITHM = -7
 ARCH = "thumbv7em-none-eabi"
 
 
-def create_metadata(firmware_image: bytes, partition_address: int) -> bytes:
+def hash_message(message: bytes) -> bytes:
+  """Uses SHA256 to hash a message."""
+  sha256_hash = hashlib.sha256()
+  sha256_hash.update(message)
+  return sha256_hash.digest()
+
+
+def create_metadata(firmware_image: bytes, partition_address: int, version: int,
+                    priv_key: Any) -> bytes:
   """Creates the matching metadata for the given firmware.
 
   The metadata consists of a timestamp, the expected address and a hash of
@@ -64,25 +72,26 @@ def create_metadata(firmware_image: bytes, partition_address: int) -> bytes:
     partition_address: The address to be written as a metadata property.
 
   Returns:
-    A byte array consisting of 32B hash, 4B timestamp and 4B partition address
-    in little endian encoding.
+    A byte array of page size, consisting of
+    - 32 B hash,
+    - 64 B signature,
+    at the beginning and
+    -  8 B version and
+    -  4 B partition address in little endian encoding
+    after METADATA_SIGN_OFFSET. All other bytes are 0xFF.
   """
-  t = datetime.datetime.utcnow().timestamp()
-  timestamp = struct.pack("<I", int(t))
+  if version < 0 or version >= 2**63:
+    fatal("The version must fit into an unsigned integer with 63 bit.\n"
+          "Please pass it using --version")
+  version_bytes = struct.pack("<Q", version)
   partition_start = struct.pack("<I", partition_address)
-  sha256_hash = hashlib.sha256()
-  sha256_hash.update(firmware_image)
-  sha256_hash.update(timestamp)
-  sha256_hash.update(partition_start)
-  checksum = sha256_hash.digest()
-  return checksum + timestamp + partition_start
-
-
-def hash_message(message: bytes) -> bytes:
-  """Uses SHA256 to hash a message."""
-  sha256_hash = hashlib.sha256()
-  sha256_hash.update(message)
-  return sha256_hash.digest()
+  # Prefix sizes that are a multiple of 64 suit our bootloader's SHA.
+  signed_metadata = pad_to(version_bytes + partition_start,
+                           PAGE_SIZE - METADATA_SIGN_OFFSET)
+  signed_data = signed_metadata + firmware_image
+  checksum = hash_message(signed_data)
+  signature = sign_firmware(signed_data, priv_key)
+  return pad_to(checksum + signature, METADATA_SIGN_OFFSET) + signed_metadata
 
 
 def check_info(partition_address: int, authenticator: Any):
@@ -94,9 +103,10 @@ def check_info(partition_address: int, authenticator: Any):
         data={},
     )
     if result[0x01] != partition_address:
-      fatal("Identifiers do not match.")
+      fatal(f"Identifiers do not match, received 0x{result[0x01]:0x}, "
+            f"expected 0x{partition_address:0x}.")
   except ctap.CtapError as ex:
-    error(f"Failed to read OpenSK upgrade info (error: {ex}")
+    fatal(f"Failed to read OpenSK upgrade info (error: {ex})")
 
 
 def get_kernel(board: str) -> bytes:
@@ -136,17 +146,21 @@ def generate_firmware_image(board: str) -> bytes:
   return pad_to(kernel, KERNEL_SIZE) + pad_to(app, APP_SIZE)
 
 
-def load_priv_key(priv_key_file: argparse.FileType) -> Any:
+def load_priv_key(priv_key_filename: str) -> Any:
   """Loads the ECDSA private key from the specified file."""
-  priv_key = get_private_key(priv_key_file.read())
-  if not isinstance(priv_key, ec.EllipticCurvePrivateKey):
-    fatal("Private key must be an Elliptic Curve one.")
-  if not isinstance(priv_key.curve, ec.SECP256R1):
-    fatal("Private key must use Secp256r1 curve.")
-  if priv_key.key_size != 256:
-    fatal("Private key must be 256 bits long.")
-  info("Private key is valid.")
-  return priv_key
+  try:
+    with open(priv_key_filename, "rb") as priv_key_file:
+      priv_key = get_private_key(priv_key_file.read())
+      if not isinstance(priv_key, ec.EllipticCurvePrivateKey):
+        fatal("Private key must be an Elliptic Curve one.")
+      if not isinstance(priv_key.curve, ec.SECP256R1):
+        fatal("Private key must use Secp256r1 curve.")
+      if priv_key.key_size != 256:
+        fatal("Private key must be 256 bits long.")
+      info("Private key is valid.")
+      return priv_key
+  except IOError as e:
+    fatal(f"Unable to open file: {priv_key_filename}\n{e}")
 
 
 def sign_firmware(data: bytes, priv_key: Any) -> bytes:
@@ -158,19 +172,14 @@ def sign_firmware(data: bytes, priv_key: Any) -> bytes:
 
 def main(args):
   colorama.init()
+  if not args.priv_key:
+    fatal("Please pass in a private key file using --private-key.")
 
   firmware_image = generate_firmware_image(args.board)
   partition_address = PARTITION_ADDRESS[args.board]
-  metadata = create_metadata(firmware_image, partition_address)
-
-  if not args.priv_key:
-    fatal("Please pass in a private key file using --private-key.")
   priv_key = load_priv_key(args.priv_key)
-  signed_data = firmware_image + metadata[32:40]
-  signature = {
-      "alg": ES256_ALGORITHM,
-      "signature": sign_firmware(signed_data, priv_key)
-  }
+  metadata = create_metadata(firmware_image, partition_address, args.version,
+                             priv_key)
 
   for authenticator in tqdm(get_opensk_devices(args.batch)):
     # If the device supports it, wink to show which device we upgrade.
@@ -192,25 +201,27 @@ def main(args):
         )
 
       info("Writing metadata...")
-      cbor_data = {2: metadata, 3: hash_message(metadata), 4: signature}
+      # TODO Write the correct address when the metadata is transparent.
+      cbor_data = {2: metadata, 3: hash_message(metadata)}
       authenticator.send_cbor(
           OPENSK_VENDOR_UPGRADE,
           data=cbor_data,
       )
+
     except ctap.CtapError as ex:
       message = "Failed to upgrade OpenSK"
       if ex.code.value == ctap.CtapError.ERR.INVALID_COMMAND:
         error(f"{message} (unsupported command).")
       elif ex.code.value == ctap.CtapError.ERR.INVALID_PARAMETER:
         error(f"{message} (invalid parameter, maybe a wrong byte array size?).")
-      elif ex.code.value == ctap.CtapError.ERR_INTEGRITY_FAILURE:
+      elif ex.code.value == ctap.CtapError.ERR.INTEGRITY_FAILURE:
         error(f"{message} (hashes or signature don't match).")
       elif ex.code.value == 0xF2:  # VENDOR_INTERNAL_ERROR
         error(f"{message} (internal conditions not met).")
       elif ex.code.value == 0xF3:  # VENDOR_HARDWARE_FAILURE
         error(f"{message} (internal hardware error).")
       else:
-        error(f"{message} (unexpected error: {ex}")
+        error(f"{message} (unexpected error: {ex})")
 
 
 if __name__ == "__main__":
@@ -237,9 +248,23 @@ if __name__ == "__main__":
   )
   parser.add_argument(
       "--private-key",
-      type=argparse.FileType("rb"),
+      type=str,
       default="crypto_data/opensk_upgrade.key",
       dest="priv_key",
       help=("PEM file for signing the firmware."),
   )
-  main(parser.parse_args())
+
+  parser.add_argument(
+      "--vendor-hid",
+      default=False,
+      action="store_true",
+      dest="use_vendor_hid",
+      help=("Whether to upgrade the device using the Vendor HID interface."),
+  )
+  parser.add_argument(
+      "--version",
+      type=int,
+      dest="version",
+      help=("Firmware version that is built."),
+  )
+
