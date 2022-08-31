@@ -24,7 +24,6 @@ import hashlib
 import os
 import struct
 from typing import Any
-from unittest.mock import patch
 import uuid
 
 import colorama
@@ -182,16 +181,7 @@ def main(args):
   metadata = create_metadata(firmware_image, partition_address, args.version,
                              priv_key)
 
-  if args.use_vendor_hid:
-    patcher = patch.object(hid.base, "FIDO_USAGE_PAGE", 0xFF00)
-    patcher.start()
-    info("Using the Vendor HID interface")
-
-  devices = get_opensk_devices(args.batch)
-
-  if not devices:
-    fatal("No devices found.")
-  for authenticator in tqdm(devices):
+  for authenticator in tqdm(get_opensk_devices(args.batch)):
     # If the device supports it, wink to show which device we upgrade.
     if authenticator.device.capabilities & hid.CAPABILITY.WINK:
       authenticator.device.wink()
@@ -263,6 +253,7 @@ if __name__ == "__main__":
       dest="priv_key",
       help=("PEM file for signing the firmware."),
   )
+
   parser.add_argument(
       "--vendor-hid",
       default=False,
@@ -276,4 +267,4 @@ if __name__ == "__main__":
       dest="version",
       help=("Firmware version that is built."),
   )
-  main(parser.parse_args())
+
