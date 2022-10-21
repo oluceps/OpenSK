@@ -592,9 +592,9 @@ impl TryFrom<cbor::Value> for AuthenticatorVendorConfigureParameters {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AuthenticatorVendorUpgradeParameters {
-    pub address: Option<usize>,
+    pub offset: usize,
     pub data: Vec<u8>,
-    pub hash: Vec<u8>,
+    pub hash: [u8; 32],
 }
 
 impl TryFrom<cbor::Value> for AuthenticatorVendorUpgradeParameters {
@@ -603,22 +603,16 @@ impl TryFrom<cbor::Value> for AuthenticatorVendorUpgradeParameters {
     fn try_from(cbor_value: cbor::Value) -> Result<Self, Ctap2StatusCode> {
         destructure_cbor_map! {
             let {
-                0x01 => address,
+                0x01 => offset,
                 0x02 => data,
                 0x03 => hash,
             } = extract_map(cbor_value)?;
         }
-        let address = address
-            .map(extract_unsigned)
-            .transpose()?
-            .map(|u| u as usize);
+        let offset = extract_unsigned(ok_or_missing(offset)?)? as usize;
         let data = extract_byte_string(ok_or_missing(data)?)?;
-        let hash = extract_byte_string(ok_or_missing(hash)?)?;
-        Ok(AuthenticatorVendorUpgradeParameters {
-            address,
-            data,
-            hash,
-        })
+        let hash = <[u8; 32]>::try_from(extract_byte_string(ok_or_missing(hash)?)?)
+            .map_err(|_| Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER)?;
+        Ok(AuthenticatorVendorUpgradeParameters { offset, data, hash })
     }
 }
 
@@ -1067,6 +1061,16 @@ mod test {
         let command = Command::deserialize(&cbor_bytes);
         assert_eq!(command, Err(Ctap2StatusCode::CTAP2_ERR_INVALID_CBOR));
 
+        // Missing offset
+        let cbor_value = cbor_map! {
+            0x02 => [0xFF; 0x100],
+            0x03 => [0x44; 32],
+        };
+        assert_eq!(
+            AuthenticatorVendorUpgradeParameters::try_from(cbor_value),
+            Err(Ctap2StatusCode::CTAP2_ERR_MISSING_PARAMETER)
+        );
+
         // Missing data
         let cbor_value = cbor_map! {
             0x01 => 0x1000,
@@ -1075,6 +1079,17 @@ mod test {
         assert_eq!(
             AuthenticatorVendorUpgradeParameters::try_from(cbor_value),
             Err(Ctap2StatusCode::CTAP2_ERR_MISSING_PARAMETER)
+        );
+
+        // Invalid hash size
+        let cbor_value = cbor_map! {
+            0x01 => 0x1000,
+            0x02 => [0xFF; 0x100],
+            0x03 => [0x44; 33],
+        };
+        assert_eq!(
+            AuthenticatorVendorUpgradeParameters::try_from(cbor_value),
+            Err(Ctap2StatusCode::CTAP1_ERR_INVALID_PARAMETER)
         );
 
         // Missing hash
@@ -1087,21 +1102,7 @@ mod test {
             Err(Ctap2StatusCode::CTAP2_ERR_MISSING_PARAMETER)
         );
 
-        // Valid without address
-        let cbor_value = cbor_map! {
-            0x02 => [0xFF; 0x100],
-            0x03 => [0x44; 32],
-        };
-        assert_eq!(
-            AuthenticatorVendorUpgradeParameters::try_from(cbor_value),
-            Ok(AuthenticatorVendorUpgradeParameters {
-                address: None,
-                data: vec![0xFF; 0x100],
-                hash: vec![0x44; 32],
-            })
-        );
-
-        // Valid with address
+        // Valid
         let cbor_value = cbor_map! {
             0x01 => 0x1000,
             0x02 => [0xFF; 0x100],
@@ -1110,9 +1111,9 @@ mod test {
         assert_eq!(
             AuthenticatorVendorUpgradeParameters::try_from(cbor_value),
             Ok(AuthenticatorVendorUpgradeParameters {
-                address: Some(0x1000),
+                offset: 0x1000,
                 data: vec![0xFF; 0x100],
-                hash: vec![0x44; 32],
+                hash: [0x44; 32],
             })
         );
     }
