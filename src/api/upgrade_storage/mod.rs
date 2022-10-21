@@ -1,4 +1,4 @@
-// Copyright 2021 Google LLC
+// Copyright 2021-2022 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,45 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use alloc::vec::Vec;
 use persistent_store::StorageResult;
 
 pub(crate) mod helper;
 
 /// Accessors to storage locations used for upgrading from a CTAP command.
 pub trait UpgradeStorage {
-    /// Reads a slice of the partition, if within bounds.
+    /// Processes the given data as part of an upgrade.
     ///
-    /// The offset is relative to the start of the partition.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::OutOfBounds`] if the requested slice is not inside the partition.
-    fn read_partition(&self, offset: usize, length: usize) -> StorageResult<&[u8]>;
-
-    /// Writes the given data to the given offset address, if within bounds of the partition.
-    ///
-    /// The offset is relative to the start of the partition.
+    /// The offset indicates the data location inside the bundle.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::OutOfBounds`] if the data does not fit the partition.
-    fn write_partition(&mut self, offset: usize, data: &[u8]) -> StorageResult<()>;
+    /// - Returns [`StorageError::OutOfBounds`] if the data does not fit.
+    /// - Returns [`StorageError::CustomError`] if any Metadata or other check fails.
+    fn write_bundle(&mut self, offset: usize, data: Vec<u8>) -> StorageResult<()>;
 
-    /// Returns the address of the partition.
-    fn partition_address(&self) -> usize;
-
-    /// Returns the length of the partition.
-    fn partition_length(&self) -> usize;
-
-    /// Reads the metadata location.
-    fn read_metadata(&self) -> StorageResult<&[u8]>;
-
-    /// Writes the given data into the metadata location.
+    /// Returns an identifier for the requested bundle.
     ///
-    /// The passed in data is appended with 0xFF bytes if shorter than the metadata storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::OutOfBounds`] if the data is too long to fit the metadata storage.
-    fn write_metadata(&mut self, data: &[u8]) -> StorageResult<()>;
+    /// Use this to determine whether you are writing to A or B.
+    fn bundle_identifier(&self) -> u32;
+
+    /// Returns the currently running firmware version.
+    fn running_firmware_version(&self) -> u64;
 }
